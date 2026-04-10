@@ -1,0 +1,412 @@
+// server.js — PowerTeg Messenger (all-in-one) require('dotenv').config(); const express = require('express'); const http = require('http'); const WebSocket = require('ws'); const sqlite3 = require('sqlite3').verbose(); const bcrypt = require('bcrypt'); const jwt = require('jsonwebtoken'); const helmet = require('helmet'); const rateLimit = require('express-rate-limit');
+
+// ================== КОНФИГУРАЦИЯ ================== const PORT = process.env.PORT  3000; const JWT_SECRET = process.env.JWT_SECRET  'powerteg_super_secret_key_change_me'; const SALT_ROUNDS = 10;
+
+// ================== БАЗА ДАННЫХ (SQLite) ================== const db = new sqlite3.Database('./powerteg.db');
+
+// Создание таблиц, если их нет db.serialize(() => { // Пользователи db.run(CREATE TABLE IF NOT EXISTS users ( id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, public_key TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP ));
+
+// Чаты (личные и групповые) db.run(CREATE TABLE IF NOT EXISTS chats ( id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT DEFAULT 'private', name TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP ));
+
+// Участники чатов db.run(CREATE TABLE IF NOT EXISTS chat_members ( chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, joined_at DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (chat_id, user_id), FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE, FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE ));
+
+// Сообщения (хранятся зашифрованными) db.run(CREATE TABLE IF NOT EXISTS messages ( id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, encrypted_content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE, FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE )); });
+
+// ================== EXPRESS ПРИЛОЖЕНИЕ ================== const app = express();
+
+// Middleware безопасности app.use(helmet({ contentSecurityPolicy: false, // для простоты, в продакшене настрой правильно }));
+
+// Ограничение запросов (anti-DDoS базовый) const limiter = rateLimit({ windowMs: 15 * 60 * 1000, // 15 минут max: 200, // максимум 200 запросов с одного IP message: 'Слишком много запросов, попробуйте позже.', }); app.use('/api/', limiter);
+
+app.use(express.json()); app.use(express.static('public')); // если понадобится статика
+
+// ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ================== function authenticateToken(req, res, next) { const authHeader = req.headers['authorization']; const token = authHeader && authHeader.split(' ')[1]; if (!token) return res.sendStatus(401);
+
+jwt.verify(token, JWT_SECRET, (err, user) => { if (err) return res.sendStatus(403); req.user = user; next(); }); }
+
+// ================== REST API ==================
+
+// Регистрация app.post('/api/register', async (req, res) => { const { username, password, publicKey } = req.body; if (!username  !password  !publicKey) { return res.status(400).json({ error: 'Все поля обязательны' }); } if (username.length < 3  password.length < 6) { return res.status(400).json({ error: 'Логин минимум 3 символа, пароль минимум 6' }); }
+
+try { const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS); db.run( 'INSERT INTO users (username, password_hash, public_key) VALUES (?, ?, ?)', [username, hashedPassword, publicKey], function(err) { if (err) { if (err.message.includes('UNIQUE constraint failed')) { return res.status(409).json({ error: 'Пользователь уже существует' }); } return res.status(500).json({ error: 'Ошибка сервера' }); } const token = jwt.sign({ id: this.lastID, username }, JWT_SECRET); res.json({ token, userId: this.lastID, username }); } ); } catch (err) { res.status(500).json({ error: 'Ошибка сервера' }); } });
+
+// Вход app.post('/api/login', (req, res) => { const { username, password } = req.body; if (!username  !password) return res.status(400).json({ error: 'Логин и пароль обязательны' });
+
+db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => { if (err  !user) return res.status(401).json({ error: 'Неверный логин или пароль' }); const match = await bcrypt.compare(password, user.password_hash); if (!match) return res.status(401).json({ error: 'Неверный логин или пароль' });
+
+const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
+res.json({ token, userId: user.id, username: user.username, publicKey: user.public_key });
+}); });
+
+// Поиск пользователей app.get('/api/users/search', authenticateToken, (req, res) => { const { q } = req.query; if (!q) return res.json([]);
+
+db.all( 'SELECT id, username FROM users WHERE username LIKE ? AND id != ? LIMIT 20', [%${q}%, req.user.id], (err, rows) => { if (err) return res.status(500).json({ error: 'Ошибка сервера' }); res.json(rows); } ); });
+
+// Получить список чатов текущего пользователя app.get('/api/chats', authenticateToken, (req, res) => { const userId = req.user.id; db.all( SELECT c.id, c.type, c.name, (SELECT encrypted_content FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) as last_message, (SELECT created_at FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) as last_time, (SELECT json_group_array(json_object('id', u.id, 'username', u.username))  FROM chat_members cm JOIN users u ON cm.user_id = u.id  WHERE cm.chat_id = c.id AND u.id != ?) as participants FROM chats c JOIN chat_members cm ON c.id = cm.chat_id WHERE cm.user_id = ? ORDER BY last_time DESC, [userId, userId], (err, rows) => { if (err) return res.status(500).json({ error: 'Ошибка сервера' }); // Парсим participants (если есть) rows.forEach(row => { try { row.participants = JSON.parse(row.participants  '[]'); } catch { row.participants = []; } }); res.json(rows); } ); });
+
+// Создать личный чат с пользователем app.post('/api/chats/private', authenticateToken, (req, res) => { const { userId } = req.body; // ID собеседника const myId = req.user.id;
+
+if (!userId  userId === myId) return res.status(400).json({ error: 'Некорректный запрос' });
+
+// Проверяем, существует ли уже чат между этими двумя пользователями db.get( SELECT c.id FROM chats c JOIN chat_members cm1 ON c.id = cm1.chat_id AND cm1.user_id = ? JOIN chat_members cm2 ON c.id = cm2.chat_id AND cm2.user_id = ? WHERE c.type = 'private', [myId, userId], (err, existing) => { if (err) return res.status(500).json({ error: 'Ошибка сервера' }); if (existing) return res.json({ chatId: existing.id });
+
+  // Создаём новый чат
+  db.run('INSERT INTO chats (type) VALUES (?)', ['private'], function(err) {
+    if (err) return res.status(500).json({ error: 'Ошибка сервера' });
+    const chatId = this.lastID;
+    db.run('INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?), (?, ?)',
+      [chatId, myId, chatId, userId],
+      (err) => {
+        if (err) return res.status(500).json({ error: 'Ошибка сервера' });
+        res.json({ chatId });
+      }
+    );
+  });
+}
+); });
+
+// Получить сообщения чата (последние 50) app.get('/api/messages/:chatId', authenticateToken, (req, res) => { const { chatId } = req.params; const userId = req.user.id;
+
+// Проверка доступа db.get('SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?', [chatId, userId], (err, row) => { if (err  !row) return res.status(403).json({ error: 'Доступ запрещён' });
+
+db.all(
+  `SELECT m.id, m.sender_id, u.username as sender_username, m.encrypted_content, m.created_at
+   FROM messages m
+   JOIN users u ON m.sender_id = u.id
+   WHERE m.chat_id = ?
+   ORDER BY m.created_at DESC LIMIT 50`,
+  [chatId],
+  (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Ошибка сервера' });
+    // Переворачиваем, чтобы старые были первыми
+    res.json(rows.reverse());
+  }
+);
+}); });
+
+// ================== WEBSOCKET СЕРВЕР ================== const server = http.createServer(app); const wss = new WebSocket.Server({ server });
+
+// Хранилище активных соединений: userId -> WebSocket const clients = new Map();
+
+wss.on('connection', (ws, req) => { let userId = null;
+
+ws.on('message', async (data) => { try { const msg = JSON.parse(data);
+
+  // Аутентификация по токену
+  if (msg.type === 'auth') {
+    try {
+      const decoded = jwt.verify(msg.token, JWT_SECRET);
+      userId = decoded.id;
+      clients.set(userId, ws);
+      ws.send(JSON.stringify({ type: 'auth_success' }));
+      
+      // Оповещаем контакты, что пользователь онлайн (можно расширить)
+    } catch (e) {
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid token' }));
+      ws.close();
+    }
+    return;
+  }
+
+  if (!userId) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
+    return;
+  }
+
+  // Отправка сообщения
+  if (msg.type === 'message') {
+    const { chatId, encryptedContent } = msg;
+    if (!chatId  !encryptedContent) return;
+
+    // Проверяем, что пользователь в чате
+    db.get('SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?', [chatId, userId], (err, row) => {
+      if (err  !row) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Access denied' }));
+        return;
+      }
+
+      // Сохраняем в БД
+      db.run(
+        'INSERT INTO messages (chat_id, sender_id, encrypted_content) VALUES (?, ?, ?)',
+        [chatId, userId, encryptedContent],
+        function(err) {
+          if (err) return;
+          const messageId = this.lastID;
+          
+          // Получаем имя отправителя
+          db.get('SELECT username FROM users WHERE id = ?', [userId], (err, userRow) => {
+            if (err) return;
+            const outgoingMsg = {
+              type: 'new_message',
+              chatId,
+              message: {
+                id: messageId,
+                sender_id: userId,
+                sender_username: userRow.username,
+                encrypted_content: encryptedContent,
+                created_at: new Date().toISOString()
+              }
+            };
+
+            // Рассылаем всем участникам чата (кроме отправителя, но он и так увидит через API)
+            db.all('SELECT user_id FROM chat_members WHERE chat_id = ?', [chatId], (err, members) => {
+              if (err) return;
+              members.forEach(m => {
+                const clientWs = clients.get(m.user_id);
+                if (clientWs && clientWs.readyState === WebSocket.OPEN) {
+                  clientWs.send(JSON.stringify(outgoingMsg));
+                }
+              });
+            });
+          });
+        }
+      );
+    });
+  }
+} catch (e) {
+  console.error('WebSocket error:', e);
+}
+});
+
+ws.on('close', () => { if (userId) { clients.delete(userId); // Оповестить о выходе из сети (опционально) } }); });
+
+// ================== ФРОНТЕНД (HTML, CSS, JS в одном месте) ================== // Для удобства отдаём SPA при запросе корня app.get('/', (req, res) => { res.send(`
+
+<title>PowerTeg — защищённый мессенджер</title> <style> /* ===== ОБЩИЕ СТИЛИ (ТЁМНАЯ ТЕМА) ===== */ * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Roboto, system-ui, sans-serif; } body { background: #000; color: #fff; height: 100vh; display: flex; justify-content: center; align-items: center; } #app { width: 100%; max-width: 1200px; height: 100vh; display: flex; background: #0f0f0f; box-shadow: 0 0 30px rgba(0,0,0,0.7); } /* Панель входа/регистрации */ #auth-screen { width: 100%; display: flex; justify-content: center; align-items: center; } .auth-container { background: #1a1a1a; padding: 40px; border-radius: 16px; width: 100%; max-width: 400px; box-shadow: 0 8px 20px rgba(0,0,0,0.5); } .auth-container h2 { margin-bottom: 24px; text-align: center; color: #3a8cff; } .auth-input { width: 100%; padding: 14px; margin-bottom: 16px; background: #2a2a2a; border: 1px solid #3a3a3a; border-radius: 8px; color: #fff; font-size: 16px; outline: none; transition: border 0.2s; } .auth-input:focus { border-color: #3a8cff; } .auth-btn { width: 100%; padding: 14px; background: #3a8cff; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; transition: background 0.2s; margin-top: 8px; } .auth-btn:hover { background: #2a7aef; } .auth-switch { text-align: center; margin-top: 16px; color: #aaa; } .auth-switch a { color: #3a8cff; cursor: pointer; text-decoration: none; } .auth-switch a:hover { text-decoration: underline; }
+/* Главный интерфейс мессенджера */
+#main-screen {
+  display: flex;
+  width: 100%;
+  height: 100%;
+}
+/* Боковая панель */
+.sidebar {
+  width: 320px;
+  background: #121212;
+  border-right: 1px solid #2a2a2a;
+  display: flex;
+  flex-direction: column;
+}
+.sidebar-header {
+  padding: 16px;
+  border-bottom: 1px solid #2a2a2a;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.sidebar-header h3 { font-weight: 500; color: #fff; }
+.search-box {
+  padding: 12px 16px;
+  border-bottom: 1px solid #2a2a2a;
+}
+.search-box input {
+  width: 100%;
+  padding: 10px 14px;
+  background: #1e1e1e;
+  border: 1px solid #333;
+  border-radius: 20px;
+  color: #fff;
+  outline: none;
+}
+.chat-list {
+  flex: 1;
+  overflow-y: auto;
+}
+.chat-item {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  cursor: pointer;
+  border-bottom: 1px solid #1e1e1e;
+  transition: background 0.15s;
+}
+.chat-item:hover { background: #1e1e1e; }
+.chat-item.active { background: #252525; border-left: 3px solid #3a8cff; }
+.chat-avatar {
+  width: 48px; height: 48px;
+  border-radius: 50%;
+  background: #3a8cff;
+  margin-right: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: bold;
+  color: white;
+}
+.chat-info { flex: 1; }
+.chat-name { font-weight: 500; margin-bottom: 4px; }
+.chat-last-msg {
+  font-size: 13px;
+  color: #aaa;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+/* Основная область чата */
+.chat-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: #0f0f0f;
+}
+.chat-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid #2a2a2a;
+  display: flex;
+  align-items: center;
+}
+.chat-header .chat-avatar { width: 40px; height: 40px; font-size: 14px; }
+.chat-title { margin-left: 14px; }
+.chat-title h4 { font-weight: 500; }
+.chat-title .online { font-size: 13px; color: #0acb8c; }
+.messages-container {
+  flex: 1;
+  padding: 20px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.message {
+  max-width: 70%;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+}
+.message.sent { align-self: flex-end; }
+.message.received { align-self: flex-start; }
+.message-bubble {
+  padding: 10px 14px;
+  border-radius: 18px;
+  word-wrap: break-word;
+  line-height: 1.4;
+  background: #2b5278;
+  color: white;
+}
+.message.received .message-bubble { background: #2c2c2c; }
+.message-meta {
+  font-size: 11px;
+  color: #888;
+  margin-top: 4px;
+  display: flex;
+  justify-content: flex-end;
+}
+.message-input-area {
+  padding: 16px 20px;
+  border-top: 1px solid #2a2a2a;
+
+display: flex;
+  gap: 12px;
+}
+.message-input-area input {
+  flex: 1;
+  padding: 12px 16px;
+  background: #1e1e1e;
+  border: 1px solid #333;
+  border-radius: 24px;
+  color: #fff;
+  outline: none;
+}
+.message-input-area button {
+  width: 48px; height: 48px;
+  border-radius: 50%;
+  background: #3a8cff;
+  border: none;
+  color: white;
+  font-size: 20px;
+  cursor: pointer;
+}
+/* Модальное окно поиска */
+.modal {
+  position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0,0,0,0.7);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+.modal-content {
+  background: #1a1a1a;
+  width: 90%; max-width: 400px;
+  border-radius: 16px;
+  padding: 20px;
+}
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.modal-close { cursor: pointer; font-size: 24px; color: #aaa; }
+.user-search-item {
+  padding: 12px;
+  border-bottom: 1px solid #2a2a2a;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.hidden { display: none !important; }
+.error-text { color: #ff4d4d; margin-top: 8px; font-size: 14px; }
+</style>
+Вход в PowerTeg
+Войти
+Нет аккаунта? Зарегистрироваться
+<!-- Основной интерфейс -->
+<div id="main-screen" class="hidden">
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h3>PowerTeg</h3>
+      <button id="new-chat-btn" style="background:none;border:none;color:#3a8cff;font-size:24px;cursor:pointer;">✎</button>
+    </div>
+    <div class="search-box">
+      <input type="text" id="chat-search" placeholder="Поиск чатов...">
+    </div>
+    <div id="chat-list-container" class="chat-list"></div>
+    <div style="padding:16px;border-top:1px solid #2a2a2a;">
+      <span id="current-username" style="color:#aaa;"></span>
+      <button id="logout-btn" style="float:right;background:none;border:none;color:#ff4d4d;cursor:pointer;">Выйти</button>
+    </div>
+  </div>
+  <div class="chat-area">
+    <div id="chat-header" class="chat-header" style="display:none;">
+      <div class="chat-avatar" id="chat-avatar">#</div>
+      <div class="chat-title">
+        <h4 id="chat-name">Выберите чат</h4>
+        <span class="online" id="chat-status"></span>
+      </div>
+    </div>
+    <div id="messages-container" class="messages-container">
+      <div style="text-align:center;color:#888;margin-top:40px;">Выберите чат для начала общения</div>
+    </div>
+    <div id="message-input-area" class="message-input-area" style="display:none;">
+      <input type="text" id="message-input" placeholder="Сообщение..." autocomplete="off">
+      <button id="send-btn">➤</button>
+    </div>
+  </div>
+</div>
+
+<!-- Модалка поиска пользователей -->
+<div id="search-modal" class="modal hidden">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h4>Новый чат</h4>
+      <span class="modal-close" id="close-modal">&times;</span>
+    </div>
+    <input type="text" id="user-search-input" class="auth-input" placeholder="Поиск пользователя...">
+    <div id="search-results" style="max-height:300px;overflow-y:auto;"></div>
+  </div>
+</div>
+<script> // ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ========== const API_URL = window.location.origin; let token = localStorage.getItem('powerteg_token'); let currentUser = null; let currentChatId = null; let chats = []; let ws = null; let userKeyPair = null; // { publicKey, privateKey } // ========== КРИПТОГРАФИЯ (E2EE) ========== async function generateKeyPair() { return await window.crypto.subtle.generateKey( { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1,0,1]), hash: "SHA-256" }, true, ["encrypt", "decrypt"] ); } async function exportPublicKey(key) { const exported = await window.crypto.subtle.exportKey("spki", key); return btoa(String.fromCharCode(...new Uint8Array(exported))); } async function importPublicKey(pem) { const binary = Uint8Array.from(atob(pem), c => c.charCodeAt(0)); return await window.crypto.subtle.importKey("spki", binary, { name: "RSA-OAEP", hash: "SHA-256" }, true, ["encrypt"]); } async function encryptMessage(publicKeyPem, text) { const key = await importPublicKey(publicKeyPem); const encoded = new TextEncoder().encode(text); const encrypted = await window.crypto.subtle.encrypt({ name: "RSA-OAEP" }, key, encoded); return btoa(String.fromCharCode(...new Uint8Array(encrypted))); } async function decryptMessage(encryptedBase64) { if (!userKeyPair) throw new Error('No private key'); const encrypted = Uint8Array.from(atob(encryptedBase64), c => c.charCodeAt(0)); const decrypted = await window.crypto.subtle.decrypt({ name: "RSA-OAEP" }, userKeyPair.privateKey, encrypted); return new TextDecoder().decode(decrypted); } // ========== ИНИЦИАЛИЗАЦИЯ ПРИЛОЖЕНИЯ ========== document.addEventListener('DOMContentLoaded', () => { if (token) { // Пробуем автоматический вход fetch(API_URL + '/api/chats', { headers: { 'Authorization': 'Bearer ' + token } }) .then(r => r.ok ?
+
+r.json() : Promise.reject()) .then(() => showMainScreen()) .catch(() => { localStorage.removeItem('powerteg_token'); showAuthScreen(); }); } else { showAuthScreen(); } }); // Переключение экранов function showAuthScreen() { document.getElementById('auth-screen').classList.remove('hidden'); document.getElementById('main-screen').classList.add('hidden'); } function showMainScreen() { document.getElementById('auth-screen').classList.add('hidden'); document.getElementById('main-screen').classList.remove('hidden'); loadChats(); connectWebSocket(); document.getElementById('current-username').textContent = currentUser?.username  ''; } // ========== АВТОРИЗАЦИЯ ========== let isLoginMode = true; document.getElementById('auth-switch-link').addEventListener('click', () => { isLoginMode = !isLoginMode; document.getElementById('auth-title').textContent = isLoginMode ? 'Вход в PowerTeg' : 'Регистрация'; document.getElementById('auth-btn').textContent = isLoginMode ? 'Войти' : 'Зарегистрироваться'; document.getElementById('auth-switch-text').textContent = isLoginMode ? 'Нет аккаунта?' : 'Уже есть аккаунт?'; document.getElementById('auth-switch-link').textContent = isLoginMode ? 'Зарегистрироваться' : 'Войти'; }); document.getElementById('auth-btn').addEventListener('click', async () => { const username = document.getElementById('auth-username').value.trim(); const password = document.getElementById('auth-password').value; const errorDiv = document.getElementById('auth-error'); errorDiv.textContent = ''; if (!username  !password) { errorDiv.textContent = 'Заполните все поля'; return; } try { if (isLoginMode) { const res = await fetch(API_URL + '/api/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({username, password}) }); const data = await res.json(); if (!res.ok) throw new Error(data.error); token = data.token; localStorage.setItem('powerteg_token', token); currentUser = { id: data.userId, username: data.username }; // Загружаем ключевую пару из localStorage или генерируем (для простоты генерируем всегда) if (!userKeyPair) { userKeyPair = await generateKeyPair(); // Сохранили бы в indexedDB, но для демо храним в памяти } showMainScreen(); } else { // Регистрация: генерируем ключи const kp = await generateKeyPair(); const publicKeyPem = await exportPublicKey(kp.publicKey); const res = await fetch(API_URL + '/api/register', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({username, password, publicKey: publicKeyPem}) }); const data = await res.json(); if (!res.ok) throw new Error(data.error); token = data.token; localStorage.setItem('powerteg_token', token); currentUser = { id: data.userId, username: data.username }; userKeyPair = kp; showMainScreen(); } } catch(e) { errorDiv.textContent = e.message; } }); document.getElementById('logout-btn').addEventListener('click', () => { localStorage.removeItem('powerteg_token'); if (ws) ws.close(); location.reload(); }); // ========== ЗАГРУЗКА ЧАТОВ ========== async function loadChats() { try { const res = await fetch(API_URL + '/api/chats', { headers: { 'Authorization': 'Bearer ' + token } }); chats = await res.json(); renderChatList(); } catch(e) { console.error(e); } } function renderChatList() { const container = document.getElementById('chat-list-container'); container.innerHTML = ''; chats.forEach(chat => { const div = document.createElement('div'); div.className = 'chat-item' + (chat.id === currentChatId ?
+
+' active' : ''); div.onclick = () => openChat(chat.id); const participants = chat.participants  []; const name = chat.type === 'private' ? (participants[0]?.username  'Чат') : (chat.name  'Группа'); div.innerHTML = \`
+\${name[0].toUpperCase()}
+\${name}
+\${chat.last_message ? '(зашифровано)' : 'Нет сообщений'}
+\`; container.appendChild(div); }); } async function openChat(chatId) { currentChatId = chatId; renderChatList(); document.getElementById('chat-header').style.display = 'flex'; document.getElementById('message-input-area').style.display = 'flex'; const chat = chats.find(c => c.id === chatId); if (chat) { const participants = chat.participants  []; const name = chat.type === 'private' ? (participants[0]?.username  'Чат') : (chat.name  'Группа'); document.getElementById('chat-name').textContent = name; document.getElementById('chat-avatar').textContent = name[0].toUpperCase(); } // Загружаем историю const res = await fetch(API_URL + '/api/messages/' + chatId, { headers: { 'Authorization': 'Bearer ' + token } }); const messages = await res.json(); const container = document.getElementById('messages-container'); container.innerHTML = ''; for (const msg of messages) { await displayMessage(msg); } } async function displayMessage(msg) { const container = document.getElementById('messages-container'); const isSent = msg.sender_id === currentUser.id; let content = msg.encrypted_content; try { content = await decryptMessage(content); } catch(e) { content = '[Не удалось расшифровать]'; } const div = document.createElement('div'); div.className = 'message ' + (isSent ? 'sent' : 'received'); div.innerHTML = \`
+\${escapeHtml(content)}
+\${msg.sender_username} · \${new Date(msg.created_at).toLocaleTimeString().slice(0,5)}
+\`; container.appendChild(div); container.scrollTop = container.scrollHeight; } function escapeHtml(text) { const div = document.createElement('div'); div.textContent = text; return div.innerHTML; } // ========== WEBSOCKET ========== function connectWebSocket() { ws = new WebSocket('ws://' + location.host); ws.onopen = () => { ws.send(JSON.stringify({ type: 'auth', token })); }; ws.onmessage = async (e) => { const data = JSON.parse(e.data); if (data.type === 'new_message' && data.chatId === currentChatId) { await displayMessage(data.message); } }; } // ========== ОТПРАВКА СООБЩЕНИЯ ========== document.getElementById('send-btn').addEventListener('click', sendMessage); document.getElementById('message-input').addEventListener('keypress', (e) => { if(e.key==='Enter') sendMessage(); }); async function sendMessage() { const input = document.getElementById('message-input'); const text = input.value.trim(); if (!text || !currentChatId) return; const chat = chats.find(c => c.id === currentChatId); const receiver = chat?.participants?.[0]; // для личного чата if (!receiver) return; // Получаем публичный ключ получателя const userRes = await fetch(API_URL + '/api/users/search?q=' + receiver.username, { headers: { 'Authorization': 'Bearer ' + token } }); const users = await userRes.json(); const receiverData = users.find(u => u.id === receiver.id); if (!receiverData) return; const encrypted = await encryptMessage(receiverData.publicKey, text); ws.send(JSON.stringify({ type: 'message', chatId: currentChatId, encryptedContent: encrypted })); input.value = ''; } // ========== ПОИСК ПОЛЬЗОВАТЕЛЕЙ И СОЗДАНИЕ ЧАТА ========== document.getElementById('new-chat-btn').addEventListener('click', () => { document.getElementById('search-modal').classList.remove('hidden'); }); document.getElementById('close-modal').addEventListener('click', () => { document.getElementById('search-modal').classList.add('hidden'); }); let searchTimeout; document.getElementById('user-search-input').addEventListener('input', (e) => { clearTimeout(searchTimeout); const q = e.target.value.trim(); if (q.length < 2) return; searchTimeout = setTimeout(async () => { const res = await fetch(API_URL + '/api/users/search?q=' + encodeURIComponent(q), { headers: { 'Authorization': 'Bearer ' + token } }); const users = await res.json();
+
+const resultsDiv = document.getElementById('search-results'); resultsDiv.innerHTML = ''; users.forEach(u => { const div = document.createElement('div'); div.className = 'user-search-item'; div.innerHTML = \`\${u.username}Начать чат\`; div.querySelector('button').onclick = async () => { const res = await fetch(API_URL + '/api/chats/private', { method: 'POST', headers: { 'Content-Type':'application/json', 'Authorization':'Bearer '+token }, body: JSON.stringify({ userId: u.id }) }); const data = await res.json(); document.getElementById('search-modal').classList.add('hidden'); await loadChats(); openChat(data.chatId); }; resultsDiv.appendChild(div); }); }, 300); }); </script> `); });
+// ================== ЗАПУСК СЕРВЕРА ================== server.listen(PORT, () => { console.log(PowerTeg server running on http://localhost:${PORT}); });
